@@ -13,3 +13,5 @@ hyper = "0.11.13"
 log = "0.4.1"
 url = "2.1.1"
 serde_json = "1.0.56"
+serde_derive = "1.0.114"
+diesel = { version = "1.0.0", features = ["postgres"] }

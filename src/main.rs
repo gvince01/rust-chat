@@ -1,9 +1,14 @@
+mod schema;
+mod models;
+
 extern crate env_logger;
 extern crate futures;
 extern crate hyper;
 #[macro_use]
 extern crate log;
 extern crate serde_json;
+extern crate serde_derive;
+extern crate diesel;
 
 use std::collections::HashMap;
 use std::error::Error;
