@@ -20,10 +20,8 @@ extern crate env_logger;
 
 use std::collections::HashMap;
 use std::env;
-use std::error::Error;
 use std::io;
 
-use hyper::header::{ContentLength, ContentType};
 use hyper::server::{Request, Response, Service};
 use hyper::Method::{Get, Post};
 use hyper::{Chunk, StatusCode};
@@ -34,11 +32,11 @@ use futures::Stream;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
 
-use maud::html;
-
+mod http_helpers;
 mod models;
 mod schema;
 
+use http_helpers::*;
 use models::{Message, NewMessage};
 
 struct Microservice;
@@ -67,27 +65,50 @@ impl Service for Microservice {
         };
 
         match (request.method(), request.path()) {
+            // Post a message as a user
             (&Post, "/") => {
                 let future = request
                     .body()
                     .concat2()
                     .and_then(parse_form)
                     .and_then(move |new_message| write_to_db(new_message, &db_connection))
-                    .then(make_post_response);
+                    .then(post_response);
                 Box::new(future)
             }
+            // Get all messages - optionally between a time range
             (&Get, "/") => {
                 let time_range = match request.query() {
-                    Some(query) => parse_query(query),
+                    Some(query) => parse_timestamp(query),
                     None => Ok(TimeRange {
                         before: None,
                         after: None,
                     }),
                 };
                 let response = match time_range {
-                    Ok(time_range) => make_get_response(query_db(time_range, &db_connection)),
-                    Err(error) => make_error_response(&error),
+                    Ok(time_range) => {
+                        get_response(query_all_messages_by_time(time_range, &db_connection))
+                    }
+                    Err(error) => error_response(&error),
                 };
+                Box::new(response)
+            }
+            // Get all messages for a user
+            (&Get, "/user") => {
+                let response = match request.query() {
+                    Some(query) => {
+                        let user = parse_username(query);
+                        match user {
+                            Ok(username) => {
+                                let user_messages =
+                                    query_messages_by_user(&username, &db_connection);
+                                get_response(user_messages)
+                            }
+                            Err(err) => error_response(&err),
+                        }
+                    }
+                    None => futures::future::ok(Response::new().with_status(StatusCode::NotFound)),
+                };
+
                 Box::new(response)
             }
             _ => Box::new(futures::future::ok(
@@ -97,7 +118,10 @@ impl Service for Microservice {
     }
 }
 
-fn query_db(time_range: TimeRange, db_connection: &PgConnection) -> Option<Vec<Message>> {
+fn query_all_messages_by_time(
+    time_range: TimeRange,
+    db_connection: &PgConnection,
+) -> Option<Vec<Message>> {
     use schema::messages;
     let TimeRange { before, after } = time_range;
     let query_result = match (before, after) {
@@ -122,6 +146,21 @@ fn query_db(time_range: TimeRange, db_connection: &PgConnection) -> Option<Vec<M
     }
 }
 
+fn query_messages_by_user(user_name: &str, db_connection: &PgConnection) -> Option<Vec<Message>> {
+    use schema::messages;
+    let query_result = messages::table
+        .filter(messages::username.eq(user_name.to_string()))
+        .load::<Message>(db_connection);
+
+    match query_result {
+        Ok(result) => Some(result),
+        Err(error) => {
+            error!("Error querying DB: {}", error);
+            None
+        }
+    }
+}
+
 fn connect_to_db() -> Option<PgConnection> {
     let database_url = env::var("DATABASE_URL").unwrap_or(String::from(DEFAULT_DATABASE_URL));
     match PgConnection::establish(&database_url) {
@@ -133,7 +172,7 @@ fn connect_to_db() -> Option<PgConnection> {
     }
 }
 
-fn parse_query(query: &str) -> Result<TimeRange, String> {
+fn parse_timestamp(query: &str) -> Result<TimeRange, String> {
     let args = url::form_urlencoded::parse(query.as_bytes())
         .into_owned()
         .collect::<HashMap<String, String>>();
@@ -156,6 +195,18 @@ fn parse_query(query: &str) -> Result<TimeRange, String> {
         before: before.map(|b| b.unwrap()),
         after: after.map(|a| a.unwrap()),
     })
+}
+
+fn parse_username(query: &str) -> Result<String, String> {
+    let args = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect::<HashMap<String, String>>();
+
+    let username = args.get("username");
+    match username {
+        Some(user) => Ok(user.parse().unwrap()),
+        None => Err(format!("Error parsing 'username'")),
+    }
 }
 
 fn parse_form(form_chunk: Chunk) -> FutureResult<NewMessage, hyper::Error> {
@@ -195,68 +246,6 @@ fn write_to_db(
             )))
         }
     }
-}
-
-fn make_post_response(
-    result: Result<i64, hyper::Error>,
-) -> FutureResult<hyper::Response, hyper::Error> {
-    match result {
-        Ok(timestamp) => {
-            let payload = json!({ "timestamp": timestamp }).to_string();
-            let response = Response::new()
-                .with_header(ContentLength(payload.len() as u64))
-                .with_header(ContentType::json())
-                .with_body(payload);
-            debug!("{:?}", response);
-            futures::future::ok(response)
-        }
-        Err(error) => make_error_response(&error.to_string()),
-    }
-}
-
-fn make_get_response(
-    messages: Option<Vec<Message>>,
-) -> FutureResult<hyper::Response, hyper::Error> {
-    let response = match messages {
-        Some(messages) => {
-            let body = render_page(messages);
-            Response::new()
-                .with_header(ContentLength(body.len() as u64))
-                .with_body(body)
-        }
-        None => Response::new().with_status(StatusCode::InternalServerError),
-    };
-    debug!("{:?}", response);
-    futures::future::ok(response)
-}
-
-fn make_error_response(error_message: &str) -> FutureResult<hyper::Response, hyper::Error> {
-    let payload = json!({ "error": error_message }).to_string();
-    let response = Response::new()
-        .with_header(ContentLength(payload.len() as u64))
-        .with_header(ContentType::json())
-        .with_body(payload);
-    debug!("{:?}", response);
-    futures::future::ok(response)
-}
-
-fn render_page(messages: Vec<Message>) -> String {
-    (html! {
-        head {
-            title { "microservice" }
-            style { "body { font-family: monospace }" }
-        }
-        body {
-            ul {
-                @for message in &messages {
-                    li {
-                        (message.username) " (" (message.timestamp) "): " (message.message)
-                    }
-                }
-            }
-        }
-    })
-    .into_string()
 }
 
 fn main() {
